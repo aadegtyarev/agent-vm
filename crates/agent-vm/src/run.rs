@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
@@ -42,6 +42,49 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   exist in the guest image and would silently fall back to C). Also
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
+
+/// Parse `--env KEY=VALUE` pairs, rejecting names that aren't POSIX-ish.
+///
+/// Returns the pairs in command-line order; a repeated `KEY` is left in
+/// place and wins by being applied later, matching shell assignment
+/// semantics (`FOO=1 FOO=2 cmd` sees `FOO=2`).
+///
+/// The name check is the security-relevant part. Everything after the
+/// first `=` is the value and is passed through verbatim (values legally
+/// contain `=`, spaces, and newlines — a CA bundle path, a proxy URL with
+/// a query string). The *name* is not free-form: `execve`'s envp is a
+/// `NUL`-terminated array of `KEY=VALUE` strings, and a name carrying `=`,
+/// a newline, or a `NUL` is how one assignment becomes two in a consumer
+/// that re-splits the environment (a shell `export` line, a `.env` dump).
+/// Restricting names to `[A-Za-z_][A-Za-z0-9_]*` closes that off and
+/// costs nothing real — a name outside it is unusable from a POSIX shell
+/// anyway.
+fn parse_env_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    fn name_is_posix(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    let mut out = Vec::with_capacity(pairs.len());
+    for raw in pairs {
+        let (key, value) = raw.split_once('=').ok_or_else(|| {
+            anyhow!("--env expects KEY=VALUE, got {raw:?} (no '='). Example: --env HTTPS_PROXY=http://127.0.0.1:8080")
+        })?;
+        if !name_is_posix(key) {
+            bail!(
+                "--env name {key:?} is not a valid environment-variable name \
+                 (expected [A-Za-z_][A-Za-z0-9_]*). The value may contain anything; \
+                 the name may not, or one assignment could become two in the guest."
+            );
+        }
+        out.push((key.to_string(), value.to_string()));
+    }
+    Ok(out)
+}
 
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
@@ -356,6 +399,74 @@ pub struct Args {
     /// it.
     #[arg(long = "allow-host", default_value_t = false, help_heading = "Network egress")]
     allow_host: bool,
+
+    /// Route all guest egress through this HTTP proxy for THIS launch.
+    ///
+    /// The network stack already tunnels guest egress through the host's
+    /// proxy via `CONNECT`, but it discovers it from the ambient
+    /// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` environment. That is fine for
+    /// a machine that lives behind one corporate proxy and wrong for an
+    /// embedder that brokers a *different*, short-lived proxy per launch
+    /// (a credential vault that terminates TLS to inject secrets, say):
+    /// exporting the variable would also redirect every unrelated tool in
+    /// the operator's shell.
+    ///
+    /// This flag sets that environment for our own process before the stack
+    /// reads it, so the route is explicit, scoped to the launch, and visible
+    /// in `--help` instead of being ambient state. An explicit
+    /// `--env HTTPS_PROXY=…` still reaches the *guest's* environment; this
+    /// governs where the *host-side* stack re-originates connections, which
+    /// is a different thing and deliberately not the same knob.
+    ///
+    /// A proxy that terminates TLS also needs `--egress-ca`.
+    #[arg(long = "egress-proxy", env = "AGENT_VM_EGRESS_PROXY", value_name = "URL",
+          help_heading = "Network egress")]
+    egress_proxy: Option<String>,
+
+    /// Trust this CA (PEM) on the upstream leg of the TLS intercept
+    /// (repeatable).
+    ///
+    /// Needed when `--egress-proxy` points at a MITM proxy: it re-signs
+    /// server certificates with a private CA that the host's native root
+    /// store has never heard of, so the intercept's upstream handshake
+    /// fails without this. Only the *upstream* connector is affected — the
+    /// guest keeps trusting the intercept CA and never sees this one.
+    ///
+    /// The file is read at boot by the network stack; a missing or
+    /// unreadable path is rejected here rather than degrading into
+    /// "every TLS connection fails" once the VM is up.
+    /// The env alias carries a single path; repeat the flag for more (a
+    /// delimiter would split legitimate paths that contain it).
+    #[arg(long = "egress-ca", env = "AGENT_VM_EGRESS_CA", value_name = "PEM",
+          help_heading = "Network egress")]
+    egress_ca: Vec<PathBuf>,
+
+    /// Inject an environment variable into the guest (repeatable).
+    ///
+    /// `--env KEY=VALUE` sets `KEY` for the agent process inside the VM.
+    /// Until now the guest env was a closed set — a hardcoded list
+    /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), `PATH`, and
+    /// `GUEST_ALWAYS_ENV` — so an embedder that computes configuration on
+    /// the host (a credential broker handing out a per-launch endpoint, a
+    /// cache location, a feature flag) had no way in short of baking it
+    /// into the image or dropping an `.agent-vm.runtime.sh` into the
+    /// project, which is a project file, not a launch parameter.
+    ///
+    /// The value is passed verbatim; `KEY` must be a POSIX-ish name
+    /// (`[A-Za-z_][A-Za-z0-9_]*`) so it cannot smuggle a second assignment
+    /// or a newline into the guest environment. A repeated `KEY` takes the
+    /// last value, matching shell assignment. These are applied *after*
+    /// the built-in guest env, so an explicit `--env PATH=…` wins — that
+    /// is the point of an override, and the operator typed it.
+    ///
+    /// Security note: this lands in the guest's environment, readable by
+    /// every process in the VM (`env`, `/proc/1/environ`). It is the right
+    /// channel for endpoints, paths and flags — not for long-lived
+    /// secrets. Secrets belong in the credential proxy (`secrets.rs`),
+    /// which substitutes them on the wire so the guest never holds the
+    /// real value.
+    #[arg(long = "env", value_name = "KEY=VALUE", help_heading = "Guest environment")]
+    env_set: Vec<String>,
 
     /// Override the OCI image reference.
     ///
@@ -738,6 +849,38 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     for cidr in &allow_egress_cidrs {
         eprintln!("==> Egress policy: allowing {cidr}");
     }
+
+    // --egress-ca: check readability now. The network stack reads these
+    // files at boot and only *logs* a read failure, after which every
+    // upstream TLS handshake fails with an opaque certificate error. A
+    // typo'd path should cost a one-line error before boot, not a VM that
+    // comes up and can't reach anything.
+    for ca in &args.egress_ca {
+        std::fs::File::open(ca)
+            .with_context(|| format!("--egress-ca {}", ca.display()))?;
+        eprintln!("==> Egress CA: trusting {} on upstream TLS", ca.display());
+    }
+
+    // --egress-proxy: publish the route into our own environment before the
+    // microsandbox network stack reads it (`ProxyConfig::from_env` at boot).
+    // Deliberately overrides an ambient HTTPS_PROXY/HTTP_PROXY: the operator
+    // named a proxy on the command line for this launch, and silently losing
+    // to a stale shell export is exactly the failure this flag exists to
+    // prevent. ALL_PROXY is left alone — it is only consulted as a fallback
+    // when the scheme-specific vars are absent, and both are set here.
+    if let Some(url) = &args.egress_proxy {
+        if microsandbox::microsandbox_network::http_proxy::ProxyConfig::from_env().is_some() {
+            eprintln!("==> Proxy: --egress-proxy overrides the ambient proxy environment");
+        }
+        // SAFETY: single-threaded launch path, before any tokio worker or
+        // the network stack has read the environment.
+        unsafe {
+            env::set_var("HTTPS_PROXY", url);
+            env::set_var("HTTP_PROXY", url);
+            env::remove_var("https_proxy");
+            env::remove_var("http_proxy");
+        }
+    }
     if args.allow_lan {
         eprintln!(
             "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
@@ -815,8 +958,22 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let state_dir = session.state_dir.clone();
         let publish_ports_for_net = publish_ports.clone();
         let allow_egress_for_net = allow_egress_cidrs.clone();
+        let egress_ca_for_net = args.egress_ca.clone();
         builder = builder.network(move |mut n| {
-            n = n.tls(|t| t);
+            // Extra roots for the *upstream* leg of the TLS intercept. When
+            // the operator routes egress through their own MITM proxy
+            // (`--egress-proxy`), that proxy re-signs every certificate with
+            // a private CA. The intercept re-originates the connection using
+            // the host's native roots only, so without this the upstream
+            // handshake fails on the first request and the guest sees an
+            // opaque TLS error. The guest's own trust is untouched — it keeps
+            // trusting the intercept CA, and the private CA never enters the VM.
+            n = n.tls(|mut t| {
+                for ca in &egress_ca_for_net {
+                    t = t.upstream_ca_cert(ca.clone());
+                }
+                t
+            });
             for p in &publish_ports_for_net {
                 let host_bind = p.host_bind;
                 n = match p.protocol {
@@ -1021,6 +1178,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             "COPILOT_GITHUB_TOKEN",
             crate::secrets::COPILOT_TOKEN_PLACEHOLDER,
         );
+    }
+
+    // Operator-supplied `--env KEY=VALUE`, applied LAST so an explicit
+    // override beats the built-ins above. Parsed (and rejected) before the
+    // VM boots: a malformed pair should cost a clap-style error, not a
+    // three-second boot followed by an agent that silently lacks its
+    // configuration.
+    for (key, value) in parse_env_assignments(&args.env_set)? {
+        eprintln!("==> Guest env: {key} (from --env)");
+        builder = builder.env(key, value);
     }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
@@ -1917,6 +2084,86 @@ mod tests {
         assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
         assert_eq!(shell_escape("don't"), "'don'\\''t'");
         assert_eq!(shell_escape(""), "''");
+    }
+
+    // ── --env KEY=VALUE injection ─────────────────────────────────
+
+    fn env_pairs(args: &[&str]) -> Result<Vec<(String, String)>> {
+        parse_env_assignments(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn env_assignment_parses_and_preserves_order() {
+        let got = env_pairs(&["FOO=1", "BAR=hello world", "_UNDERSCORE=x", "A1=2"]).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("FOO".into(), "1".into()),
+                ("BAR".into(), "hello world".into()),
+                ("_UNDERSCORE".into(), "x".into()),
+                ("A1".into(), "2".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_value_may_contain_equals_and_be_empty() {
+        // Only the FIRST `=` separates; a proxy URL with a query string or
+        // a base64 blob must survive verbatim.
+        let got = env_pairs(&[
+            "HTTPS_PROXY=http://127.0.0.1:8080/?a=b&c=d",
+            "EMPTY=",
+            "PADDED=eyJhIjoxfQ==",
+        ])
+        .unwrap();
+        assert_eq!(got[0].1, "http://127.0.0.1:8080/?a=b&c=d");
+        assert_eq!(got[1].1, "");
+        assert_eq!(got[2].1, "eyJhIjoxfQ==");
+    }
+
+    #[test]
+    fn env_repeated_key_keeps_both_so_the_last_one_wins() {
+        // Applied in order onto the builder, so the later assignment is the
+        // one the guest sees — same as `FOO=1 FOO=2 cmd` in a shell.
+        let got = env_pairs(&["FOO=first", "FOO=second"]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.last().unwrap().1, "second");
+    }
+
+    #[test]
+    fn env_without_equals_is_rejected_with_an_example() {
+        let err = env_pairs(&["JUST_A_NAME"]).unwrap_err().to_string();
+        assert!(err.contains("KEY=VALUE"), "got: {err}");
+        assert!(err.contains("--env HTTPS_PROXY="), "no example in: {err}");
+    }
+
+    #[test]
+    fn env_rejects_names_that_could_split_into_two_assignments() {
+        // The name is the security-relevant half: envp entries are
+        // `KEY=VALUE` strings, so a name carrying `=`, a newline or a NUL
+        // is how one assignment becomes two in anything that re-splits the
+        // environment (a shell `export` line, a `.env` dump).
+        for bad in [
+            "=noname",
+            "1STARTS_WITH_DIGIT=x",
+            "has space=x",
+            "has-dash=x",
+            "inject\nSECOND=x",
+            "nul\0key=x",
+            "ключ=x",
+            "a.b=x",
+        ] {
+            let err = env_pairs(&[bad]).unwrap_err().to_string();
+            assert!(
+                err.contains("not a valid environment-variable name") || err.contains("KEY=VALUE"),
+                "{bad:?} was accepted or gave a confusing error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_empty_list_is_a_no_op() {
+        assert!(env_pairs(&[]).unwrap().is_empty());
     }
 
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
