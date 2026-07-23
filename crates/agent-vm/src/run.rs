@@ -86,6 +86,42 @@ fn parse_env_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Apply `--egress-proxy` to our own environment. MUST run before the tokio
+/// runtime is built.
+///
+/// The microsandbox network stack discovers its outbound route with
+/// `ProxyConfig::from_env()` at boot, so the only way to redirect it is to be
+/// holding the right environment by then. `setenv(3)` is not thread-safe under
+/// POSIX, and this binary already keeps a manual sync `fn main` for exactly
+/// that reason (see the CRITICAL note there covering `point_at_msb`): mutating
+/// the environment after `Runtime::new()` has spawned workers is a data race
+/// against any thread reading it. So this is called from `main`, next to the
+/// other pre-runtime env mutations, not from the async launch path.
+///
+/// Overriding an ambient `HTTPS_PROXY` is deliberate — the operator named a
+/// proxy on the command line for this launch, and losing to a stale shell
+/// export is the exact failure the flag exists to prevent — but it is
+/// announced rather than silent. The lowercase spellings are removed because
+/// `from_env` prefers them; leaving them would let a stale `https_proxy` win
+/// over the flag. `ALL_PROXY` is untouched: it is only a fallback for absent
+/// scheme-specific vars, and both of those are set here.
+pub fn apply_egress_proxy(args: &Args) {
+    let Some(url) = &args.egress_proxy else {
+        return;
+    };
+    if microsandbox::microsandbox_network::http_proxy::ProxyConfig::from_env().is_some() {
+        eprintln!("==> Proxy: --egress-proxy overrides the ambient proxy environment");
+    }
+    // SAFETY: called from `main` before `Runtime::new()`, so no other thread
+    // exists to observe the environment mid-mutation.
+    unsafe {
+        env::set_var("HTTPS_PROXY", url);
+        env::set_var("HTTP_PROXY", url);
+        env::remove_var("https_proxy");
+        env::remove_var("http_proxy");
+    }
+}
+
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
         Some(s) => s,
@@ -861,26 +897,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         eprintln!("==> Egress CA: trusting {} on upstream TLS", ca.display());
     }
 
-    // --egress-proxy: publish the route into our own environment before the
-    // microsandbox network stack reads it (`ProxyConfig::from_env` at boot).
-    // Deliberately overrides an ambient HTTPS_PROXY/HTTP_PROXY: the operator
-    // named a proxy on the command line for this launch, and silently losing
-    // to a stale shell export is exactly the failure this flag exists to
-    // prevent. ALL_PROXY is left alone — it is only consulted as a fallback
-    // when the scheme-specific vars are absent, and both are set here.
-    if let Some(url) = &args.egress_proxy {
-        if microsandbox::microsandbox_network::http_proxy::ProxyConfig::from_env().is_some() {
-            eprintln!("==> Proxy: --egress-proxy overrides the ambient proxy environment");
-        }
-        // SAFETY: single-threaded launch path, before any tokio worker or
-        // the network stack has read the environment.
-        unsafe {
-            env::set_var("HTTPS_PROXY", url);
-            env::set_var("HTTP_PROXY", url);
-            env::remove_var("https_proxy");
-            env::remove_var("http_proxy");
-        }
-    }
     if args.allow_lan {
         eprintln!(
             "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
