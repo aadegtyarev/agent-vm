@@ -99,6 +99,18 @@ fn main() -> Result<()> {
         // (db, sandboxes, cache, tls/CA, logs) lives here.
         msb_install::point_at_msb_home()?;
     }
+    // Same pre-runtime rule as above, same reason: `--egress-proxy` works by
+    // holding `HTTPS_PROXY`/`HTTP_PROXY` when the microsandbox network stack
+    // reads the environment at boot, and `setenv(3)` must not race worker
+    // threads. See `run::apply_egress_proxy`.
+    match &cli.cmd {
+        Cmd::Claude(args)
+        | Cmd::Codex(args)
+        | Cmd::Opencode(args)
+        | Cmd::Copilot(args)
+        | Cmd::Shell(args) => run::apply_egress_proxy(args),
+        _ => {}
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
         match cli.cmd {
