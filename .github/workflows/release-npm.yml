@@ -556,6 +556,11 @@ jobs:
 
   publish:
     needs: [resolve-version, package]
+    # npm-публикация — только в upstream: пакеты названы @wirenboard/* и trusted
+    # publisher настроен на upstream-репозиторий. С форка publish под чужим scope
+    # всё равно упал бы (ENEEDAUTH) — не гоняем его зря. Форк распространяет
+    # собранный bundle через GitHub Release (джоб release-github ниже).
+    if: github.repository == 'wirenboard/agent-vm'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -703,3 +708,47 @@ jobs:
           fi
           cd npm-dist/agent-vm
           npm publish --provenance --access public
+
+  release-github:
+    # Форк не может публиковать под @wirenboard в npm — вместо этого выкладываем
+    # собранный bundle (agent-vm + патченый msb + libkrunfw, linux-x64) tarball'ом
+    # в GitHub Release этого репозитория. Установка без локальной сборки: скачать
+    # asset, распаковать, добавить bin/ в PATH. Апстрим этот джоб не трогает
+    # (gate ниже), у него свой npm-канал.
+    needs: [resolve-version, package]
+    if: github.repository != 'wirenboard/agent-vm'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release create/upload
+    steps:
+      - name: Download linux-x64 bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-vm-linux-x64
+          path: bundle/agent-vm-linux-x64/
+
+      - name: Pack tarball (restore +x — upload-artifact strips POSIX perms)
+        env:
+          V: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -e
+          test -f bundle/agent-vm-linux-x64/bin/agent-vm || { echo "::error::нет собранного agent-vm"; exit 1; }
+          chmod +x bundle/agent-vm-linux-x64/bin/agent-vm bundle/agent-vm-linux-x64/bin/msb
+          # -h НЕ ставим: сохраняем symlink'и libkrunfw.so (soname) как есть.
+          tar -C bundle -czf "agent-vm-linux-x64-v${V}.tar.gz" agent-vm-linux-x64
+          ls -la "agent-vm-linux-x64-v${V}.tar.gz"
+
+      - name: Create/replace GitHub release
+        env:
+          V: ${{ needs.resolve-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="v${V}"
+          # Идемпотентно: пере-создаём релиз с этим тегом (повторный прогон
+          # той же версии не должен падать «release exists»).
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" \
+            --title "agent-vm ${tag} (fork bundle)" \
+            --notes "Собранный форк-bundle (agent-vm + msb + libkrunfw), linux-x64. Установка без локальной сборки: распаковать asset, каталог bin/ в PATH. Вторая волна редизайна claude-box (флаги --env/--egress-proxy/--egress-ca)." \
+            "agent-vm-linux-x64-v${V}.tar.gz"
