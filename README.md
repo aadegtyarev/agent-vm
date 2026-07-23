@@ -168,6 +168,39 @@ Open holes per-launch with these flags — they compose:
 | `--allow-lan` | the whole `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) | dial any LAN IP |
 | `--allow-host` | the per-sandbox gateway IP, which the smoltcp stack rewrites to host `127.0.0.1` | `host.microsandbox.internal:<port>` (already in guest `/etc/hosts`) |
 
+### Routing egress through your own proxy
+
+Guest egress is re-originated by the TLS intercept and tunnelled out
+through the host's HTTP proxy via `CONNECT`, discovered from
+`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `NO_PROXY`). Two flags
+make that explicit per launch instead of ambient:
+
+| flag | what it does |
+|---|---|
+| `--egress-proxy URL` (`AGENT_VM_EGRESS_PROXY`) | route this launch's egress through `URL`, overriding any ambient proxy environment — without exporting a variable that also redirects every other tool in your shell |
+| `--egress-ca PEM` (repeatable, `AGENT_VM_EGRESS_CA`) | trust this CA on the **upstream** leg, so a proxy that terminates TLS with a private CA doesn't fail the handshake |
+
+These change *where* connections are re-originated, not what the guest
+may reach: the egress policy above still applies, so a proxy on your LAN
+still needs `--allow-egress <ip>`.
+
+`--egress-ca` affects only the host-side upstream connector — the guest
+keeps trusting the intercept CA and never sees your proxy's CA. Note
+`--env HTTPS_PROXY=…` is a different knob: it sets the *guest's*
+environment and does not move the intercept.
+
+### Guest environment
+
+`--env KEY=VALUE` (repeatable) injects a variable into the agent's
+environment inside the VM. It is applied after the built-in guest
+environment, so an explicit `--env PATH=…` wins. Names must look like
+`[A-Za-z_][A-Za-z0-9_]*`; values are passed through verbatim.
+
+Use it for endpoints, paths and flags — not for long-lived secrets. The
+guest environment is readable by every process in the VM; secrets belong
+in the credential proxy, which substitutes them on the wire so the guest
+never holds the real value.
+
 Loopback (guest's own `127.0.0.1`), link-local, and cloud metadata
 (`169.254.169.254`) stay denied even with `--allow-lan` — they're
 disjoint groups by design. `--allow-host` is the narrowest way to

@@ -419,7 +419,8 @@ pub struct Args {
     /// is a different thing and deliberately not the same knob.
     ///
     /// A proxy that terminates TLS also needs `--egress-ca`.
-    #[arg(long = "egress-proxy", value_name = "URL", help_heading = "Network egress")]
+    #[arg(long = "egress-proxy", env = "AGENT_VM_EGRESS_PROXY", value_name = "URL",
+          help_heading = "Network egress")]
     egress_proxy: Option<String>,
 
     /// Trust this CA (PEM) on the upstream leg of the TLS intercept
@@ -434,7 +435,10 @@ pub struct Args {
     /// The file is read at boot by the network stack; a missing or
     /// unreadable path is rejected here rather than degrading into
     /// "every TLS connection fails" once the VM is up.
-    #[arg(long = "egress-ca", value_name = "PEM", help_heading = "Network egress")]
+    /// The env alias carries a single path; repeat the flag for more (a
+    /// delimiter would split legitimate paths that contain it).
+    #[arg(long = "egress-ca", env = "AGENT_VM_EGRESS_CA", value_name = "PEM",
+          help_heading = "Network egress")]
     egress_ca: Vec<PathBuf>,
 
     /// Inject an environment variable into the guest (repeatable).
