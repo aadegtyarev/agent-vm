@@ -59,22 +59,27 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 /// Restricting names to `[A-Za-z_][A-Za-z0-9_]*` closes that off and
 /// costs nothing real — a name outside it is unusable from a POSIX shell
 /// anyway.
-fn parse_env_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
-    fn name_is_posix(name: &str) -> bool {
-        let mut chars = name.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+/// A guest env var name is valid iff it's a POSIX-ish identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). The name is the security-relevant half: envp
+/// entries are `KEY=VALUE` strings, so a name carrying `=`, a newline or a NUL
+/// is how one assignment silently becomes two in a consumer that re-splits the
+/// environment. Values are free-form; names are not.
+fn env_name_is_posix(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
     }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
+fn parse_env_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(pairs.len());
     for raw in pairs {
         let (key, value) = raw.split_once('=').ok_or_else(|| {
             anyhow!("--env expects KEY=VALUE, got {raw:?} (no '='). Example: --env HTTPS_PROXY=http://127.0.0.1:8080")
         })?;
-        if !name_is_posix(key) {
+        if !env_name_is_posix(key) {
             bail!(
                 "--env name {key:?} is not a valid environment-variable name \
                  (expected [A-Za-z_][A-Za-z0-9_]*). The value may contain anything; \
@@ -82,6 +87,41 @@ fn parse_env_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
             );
         }
         out.push((key.to_string(), value.to_string()));
+    }
+    Ok(out)
+}
+
+/// Parse `--env-file KEY=PATH` pairs: read the value from a file instead of the
+/// command line, so a secret never lands in `argv` (visible in `ps` to any
+/// process on the host). Same guest env as `--env`, only the transport of the
+/// value differs.
+///
+/// A single trailing newline is stripped (`printf 'tok' > f` vs `echo tok > f`
+/// — the common `echo`/redirect idiom appends one), but no other trimming: a
+/// value may legitimately contain spaces or interior newlines. The name is
+/// validated exactly like `--env`.
+fn parse_env_file_assignments(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(pairs.len());
+    for raw in pairs {
+        let (key, path) = raw.split_once('=').ok_or_else(|| {
+            anyhow!("--env-file expects KEY=PATH, got {raw:?} (no '='). Example: --env-file TOKEN=/run/secrets/tok")
+        })?;
+        if !env_name_is_posix(key) {
+            bail!(
+                "--env-file name {key:?} is not a valid environment-variable name \
+                 (expected [A-Za-z_][A-Za-z0-9_]*)."
+            );
+        }
+        let mut value = std::fs::read_to_string(path)
+            .with_context(|| format!("--env-file {key}: reading {path}"))?;
+        // Strip ONE trailing newline (\n or \r\n) — the echo/redirect idiom.
+        if value.ends_with('\n') {
+            value.pop();
+            if value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        out.push((key.to_string(), value));
     }
     Ok(out)
 }
@@ -503,6 +543,22 @@ pub struct Args {
     /// real value.
     #[arg(long = "env", value_name = "KEY=VALUE", help_heading = "Guest environment")]
     env_set: Vec<String>,
+
+    /// Inject an env var whose value is read from a FILE, not the command line
+    /// (repeatable).
+    ///
+    /// `--env-file KEY=PATH` sets `KEY` in the guest to the contents of `PATH`.
+    /// Same result as `--env KEY=VALUE`, but the value never appears in `argv`,
+    /// so a secret handed to the guest this way is not visible in `ps` to other
+    /// processes on the host. A credential broker that must put a token in the
+    /// guest environment (an inject-style secret) should use this, not `--env`.
+    ///
+    /// One trailing newline is stripped (the `echo tok > file` idiom); the name
+    /// is validated like `--env`. The same caveat applies: the value lands in
+    /// the guest environment, readable by every process in the VM — this hides
+    /// it from the host's `ps`, not from the guest.
+    #[arg(long = "env-file", value_name = "KEY=PATH", help_heading = "Guest environment")]
+    env_file: Vec<String>,
 
     /// Override the OCI image reference.
     ///
@@ -1203,6 +1259,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // configuration.
     for (key, value) in parse_env_assignments(&args.env_set)? {
         eprintln!("==> Guest env: {key} (from --env)");
+        builder = builder.env(key, value);
+    }
+    // --env-file: value read from a file, so the secret never hit argv. Applied
+    // after --env; a repeated KEY takes the last, same as --env. We log only the
+    // name, never the value.
+    for (key, value) in parse_env_file_assignments(&args.env_file)? {
+        eprintln!("==> Guest env: {key} (from --env-file)");
         builder = builder.env(key, value);
     }
 
@@ -2106,6 +2169,49 @@ mod tests {
 
     fn env_pairs(args: &[&str]) -> Result<Vec<(String, String)>> {
         parse_env_assignments(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn env_file_pairs(args: &[&str]) -> Result<Vec<(String, String)>> {
+        parse_env_file_assignments(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn env_file_reads_value_from_file_not_argv() {
+        // Значение секрета лежит в файле, argv несёт только KEY=PATH.
+        let dir = std::env::temp_dir().join("av-envfile-test-basic");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("tok");
+        std::fs::write(&p, "s3cr3t-token\n").unwrap(); // echo-идиома: trailing \n
+        let got = env_file_pairs(&[&format!("TOKEN={}", p.display())]).unwrap();
+        assert_eq!(got, vec![("TOKEN".to_string(), "s3cr3t-token".to_string())],
+                   "одиночный trailing \\n срезан, значение из файла");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn env_file_preserves_interior_content_and_crlf() {
+        let dir = std::env::temp_dir().join("av-envfile-test-interior");
+        let _ = std::fs::create_dir_all(&dir);
+        // интерьерные \n и пробелы сохраняются; срезается только ОДИН хвостовой
+        let p = dir.join("multi");
+        std::fs::write(&p, "line1\nline2\r\n").unwrap();
+        let got = env_file_pairs(&[&format!("K={}", p.display())]).unwrap();
+        assert_eq!(got[0].1, "line1\nline2", "только один хвостовой \\r\\n срезан");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn env_file_missing_file_is_a_clean_error() {
+        let err = env_file_pairs(&["TOKEN=/nope/does/not/exist"]).unwrap_err().to_string();
+        assert!(err.contains("--env-file TOKEN"), "нет имени в ошибке: {err}");
+    }
+
+    #[test]
+    fn env_file_rejects_no_equals_and_bad_name() {
+        assert!(env_file_pairs(&["JUST_PATH"]).unwrap_err().to_string().contains("KEY=PATH"));
+        // плохое имя ловится до чтения файла (файла может и не быть)
+        let err = env_file_pairs(&["1BAD=/tmp/x"]).unwrap_err().to_string();
+        assert!(err.contains("not a valid environment-variable name"), "{err}");
     }
 
     #[test]
