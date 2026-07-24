@@ -742,13 +742,18 @@ jobs:
         env:
           V: ${{ needs.resolve-version.outputs.version }}
           GH_TOKEN: ${{ github.token }}
+          # --repo явно: джоб не делает checkout (качает только артефакт), поэтому
+          # git-репозитория в cwd нет, а gh release без --repo его требует
+          # (fatal: not a git repository).
+          REPO: ${{ github.repository }}
         run: |
           set -e
           tag="v${V}"
           # Идемпотентно: пере-создаём релиз с этим тегом (повторный прогон
           # той же версии не должен падать «release exists»).
-          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$tag" \
+          gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --repo "$REPO" \
+            --target "$GITHUB_SHA" \
             --title "agent-vm ${tag} (fork bundle)" \
             --notes "Собранный форк-bundle (agent-vm + msb + libkrunfw), linux-x64. Установка без локальной сборки: распаковать asset, каталог bin/ в PATH. Вторая волна редизайна claude-box (флаги --env/--egress-proxy/--egress-ca)." \
             "agent-vm-linux-x64-v${V}.tar.gz"
