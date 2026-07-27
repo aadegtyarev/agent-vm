@@ -913,17 +913,60 @@ fn write_agent_config_defaults(
     Ok(())
 }
 
+/// Is the host access token already expired (or about to be)?
+///
+/// `expiresAt` is epoch **milliseconds**. A small skew is subtracted so a token
+/// that dies seconds from now counts as expired — the guest would otherwise
+/// start with a credential that expires mid-handshake.
+fn access_token_expired(oauth: &Value) -> bool {
+    const SKEW_MS: u128 = 60_000;
+    let Some(expires_at) = oauth.get("expiresAt").and_then(|v| v.as_u64()) else {
+        return false; // нет поля — не выдумываем протухание
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (expires_at as u128).saturating_sub(SKEW_MS) <= now_ms
+}
+
 fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(host_path) = host_claude_creds_path() else {
         return Ok(None);
     };
-    let raw = match std::fs::read_to_string(&host_path) {
+    let mut raw = match std::fs::read_to_string(&host_path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
     };
-    let json: Value = serde_json::from_str(&raw)
+    let mut json: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", host_path.display()))?;
+
+    // ПРОСРОЧЕННЫЙ токен обновляем ЗДЕСЬ, до снапшота. Раньше launch-путь брал
+    // accessToken как есть, и если оператор давно не запускал claude на хосте,
+    // гость стартовал с мёртвым токеном и падал «OAuth session expired and could
+    // not be refreshed» — хотя refresh-токен был жив и хостовый `claude` его
+    // обновлял одной командой. Ротацию делает сам хостовый агент (он владеет
+    // OAuth-цепочкой), мы лишь дёргаем его и перечитываем файл; тот же приём
+    // уже применяется в hook-пути на 401 (intercept_hook::rotate_anthropic).
+    // Fail-soft: не смогли обновить — идём со старым токеном (как раньше), а не
+    // валим запуск: гость сам скажет честно, если токен не примут.
+    if json.get("claudeAiOauth").is_some_and(access_token_expired) {
+        tracing::info!("host access token expired — rotating via host claude before snapshot");
+        match crate::intercept_hook::trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])
+        {
+            Ok(()) => {
+                raw = std::fs::read_to_string(&host_path)
+                    .with_context(|| format!("re-reading {}", host_path.display()))?;
+                json = serde_json::from_str(&raw)
+                    .with_context(|| format!("parsing refreshed {}", host_path.display()))?;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "host credential rotation failed; snapshotting the stale token as-is"
+            ),
+        }
+    }
 
     let oauth = json
         .get("claudeAiOauth")
@@ -1519,6 +1562,32 @@ impl Drop for ProjectRefreshLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Launch-path expiry check: an already-dead access token must be detected
+    /// so the launcher rotates BEFORE snapshotting it into the guest. Without
+    /// this the guest starts with a dead credential and fails with "OAuth
+    /// session expired and could not be refreshed" — while the host's refresh
+    /// token was alive all along (reproduced live, 2026-07-25).
+    #[test]
+    fn expired_access_token_is_detected() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let past = serde_json::json!({ "expiresAt": now_ms - 3_600_000 });
+        assert!(access_token_expired(&past), "просроченный не распознан");
+
+        let future = serde_json::json!({ "expiresAt": now_ms + 3_600_000 });
+        assert!(!access_token_expired(&future), "живой помечен просроченным");
+
+        // Дохнет через 10с — считаем просроченным (иначе умрёт на хендшейке).
+        let soon = serde_json::json!({ "expiresAt": now_ms + 10_000 });
+        assert!(access_token_expired(&soon), "почти-мёртвый должен ротироваться");
+
+        // Нет поля — не выдумываем протухание (не все формы кред его несут).
+        let absent = serde_json::json!({ "scopes": ["x"] });
+        assert!(!access_token_expired(&absent), "отсутствие expiresAt ≠ просрочен");
+    }
 
     /// Security invariant: the real-token files must never live under
     /// `state_dir`, because the launcher bind-mounts `state_dir` into the

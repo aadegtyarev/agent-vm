@@ -1110,7 +1110,12 @@ mod refresh_lock_tests {
 /// budget rather than drifting from it.
 const HOST_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
+/// Ask the HOST agent to rotate its own OAuth credentials (it writes the
+/// fresh tokens back into its `.credentials.json`), then the caller re-reads
+/// that file. `pub(crate)` because the LAUNCH path needs the same rotation:
+/// snapshotting an already-expired access token hands the guest a dead
+/// credential (see `secrets::refresh_anthropic`).
+pub(crate) fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
     use std::time::{Duration, Instant};
     const TIMEOUT: Duration = HOST_REFRESH_TIMEOUT;
 
